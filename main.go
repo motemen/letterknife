@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	flag "github.com/spf13/pflag"
+	"golang.org/x/text/encoding/ianaindex"
 )
 
 func debugf(format string, args ...interface{}) {
@@ -23,6 +24,18 @@ func debugf(format string, args ...interface{}) {
 func fatalf(format string, args ...interface{}) {
 	log.Printf("fatal: "+format, args...)
 	os.Exit(1)
+}
+
+var mimeDecoder = new(mime.WordDecoder)
+
+func init() {
+	mimeDecoder.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+		enc, err := ianaindex.MIME.Encoding(charset)
+		if err != nil {
+			return nil, err
+		}
+		return enc.NewDecoder().Reader(input), nil
+	}
 }
 
 // --match-address From:...
@@ -51,7 +64,7 @@ func main() {
 	if *matchAddress != "" {
 		ok, err := checkMatch(msg.Header, *matchAddress, true)
 		if err != nil {
-			fatalf("checkMatch: %s", err)
+			fatalf("checkMatch(%s): %v", *matchAddress, err)
 		}
 		if !ok {
 			pass = false
@@ -61,7 +74,7 @@ func main() {
 	if *matchHeader != "" {
 		ok, err := checkMatch(msg.Header, *matchHeader, false)
 		if err != nil {
-			fatalf("checkMatch: %s", err)
+			fatalf("checkMatch(%s): %v", *matchHeader, err)
 		}
 		if !ok {
 			pass = false
@@ -118,7 +131,7 @@ func main() {
 		if len(parts) != 0 {
 			fatalf("cannot print header when selecting subparts")
 		}
-		s, err := new(mime.WordDecoder).DecodeHeader(msg.Header.Get(*printHeader))
+		s, err := mimeDecoder.DecodeHeader(msg.Header.Get(*printHeader))
 		if err != nil {
 			fatalf("decoding header %q failed: %v", *printHeader, err)
 		}
@@ -134,7 +147,7 @@ func checkMatch(h mail.Header, in string, isAddr bool) (bool, error) {
 	header, pattern := in[0:p], in[p+1:]
 
 	for _, value := range strings.Split(h.Get(header), ",") {
-		value, err := new(mime.WordDecoder).DecodeHeader(value)
+		value, err := mimeDecoder.DecodeHeader(value)
 		if err != nil {
 			return false, err
 		}
