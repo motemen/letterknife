@@ -49,7 +49,7 @@ func main() {
 	matchAddress := flag.String("match-address", "", "Filter: address header `header:pattern` eg. \"From:*@example.com\"")
 	matchHeader := flag.String("match-header", "", "Filter: header `header:pattern` eg. \"Subject:foobar\"")
 	selectPart := flag.String("select-part", "", "Select: part by content type")
-	printContent := flag.Bool("print-content", false, "Action: print decoded content")
+	printContent := flag.Bool("print-content", false, "Action: print decoded content") // TODO: make default
 	printHeader := flag.String("print-header", "", "Action: print header")
 	flag.CommandLine.SortFlags = false
 	flag.Parse()
@@ -86,7 +86,7 @@ func main() {
 	}
 
 	// TODO: recurse
-	var parts []*bytes.Buffer
+	var parts []mailPart
 	if *selectPart != "" {
 		mt, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
 		if err != nil {
@@ -94,33 +94,20 @@ func main() {
 		}
 		if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
 			mr := multipart.NewReader(msg.Body, params["boundary"])
-			for {
-				p, err := mr.NextPart()
-				if err == io.EOF {
-					break
-				} else if err != nil {
-					fatalf("%v", err)
-				}
-
-				// FIXME
-				if strings.HasPrefix(p.Header.Get("Content-Type"), *selectPart) {
-					var buf bytes.Buffer
-					_, err := io.Copy(&buf, p)
-					if err != nil {
-						fatalf("%v", err)
-					}
-					parts = append(parts, &buf)
-				}
+			parts, err = selectParts(mr, *selectPart)
+			if err != nil {
+				log.Fatal(err)
 			}
 		}
 	}
 
 	var r io.Reader = msg.Body
+	// TODO: do this for parts too
 	if strings.EqualFold(msg.Header.Get("Content-Transfer-Encoding"), "base64") {
 		r = base64.NewDecoder(base64.RawStdEncoding, r)
 	}
 	if len(parts) != 0 {
-		r = parts[0]
+		r = parts[0].body
 	}
 
 	if *printContent {
@@ -137,6 +124,55 @@ func main() {
 		}
 		fmt.Println(s)
 	}
+}
+
+type mailPart struct {
+	header mail.Header
+	body   io.Reader
+}
+
+// TODO: selectParts(part, spec) (parts, error)
+// errNotMultipart
+func selectParts(mr *multipart.Reader, spec string) ([]mailPart, error) {
+	var parts []mailPart
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("reading multipart: %v", err)
+		}
+
+		ct := p.Header.Get("Content-Type")
+		debugf("selectParts: ct=%s", ct)
+		mt, params, err := mime.ParseMediaType(ct)
+		if err != nil {
+			return nil, fmt.Errorf("parsing content-type %q: %v", ct, err)
+		}
+
+		ok, err := testPattern(mt, spec)
+		if err != nil {
+			return nil, err
+		}
+
+		if ok {
+			var buf bytes.Buffer
+			_, err := io.Copy(&buf, p)
+			if err != nil {
+				fatalf("%v", err)
+			}
+			parts = append(parts, mailPart{header: mail.Header(p.Header), body: &buf})
+		} else if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
+			mr := multipart.NewReader(p, params["boundary"])
+			subparts, err := selectParts(mr, spec)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, subparts...)
+		}
+	}
+
+	return parts, nil
 }
 
 func checkMatch(h mail.Header, in string, isAddr bool) (bool, error) {
@@ -188,6 +224,14 @@ func testHeader(value, pattern string, isAddr bool) (bool, error) {
 			return false, fmt.Errorf("parsing address %q: %w", value, err)
 		}
 		value = addr.Address
+	}
+
+	return testPattern(value, pattern)
+}
+
+func testPattern(value, pattern string) (bool, error) {
+	if strings.IndexByte(pattern, '*') == -1 {
+		return value == pattern, nil
 	}
 
 	rx, err := regexpFromPattern(pattern)
