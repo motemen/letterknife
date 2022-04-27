@@ -88,37 +88,32 @@ func main() {
 	// TODO: recurse
 	var parts []mailPart
 	if *selectPart != "" {
-		mt, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+		parts, err = selectParts(mailPart{header: msg.Header, body: msg.Body}, *selectPart)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
-			mr := multipart.NewReader(msg.Body, params["boundary"])
-			parts, err = selectParts(mr, *selectPart)
-			if err != nil {
-				log.Fatal(err)
-			}
+		if len(parts) == 0 {
+			fatalf("select failed")
 		}
 	}
 
-	var r io.Reader = msg.Body
-	// TODO: do this for parts too
-	if strings.EqualFold(msg.Header.Get("Content-Transfer-Encoding"), "base64") {
-		r = base64.NewDecoder(base64.RawStdEncoding, r)
+	var target mailPart
+	if len(parts) > 0 {
+		target = parts[0]
+	} else {
+		target = mailPart{header: msg.Header, body: msg.Body}
 	}
-	if len(parts) != 0 {
-		r = parts[0].body
+
+	if strings.EqualFold(target.header.Get("Content-Transfer-Encoding"), "base64") {
+		target.body = base64.NewDecoder(base64.RawStdEncoding, target.body)
 	}
 
 	if *printContent {
-		_, _ = io.Copy(os.Stdout, r)
+		_, _ = io.Copy(os.Stdout, target.body)
 	}
 
 	if *printHeader != "" {
-		if len(parts) != 0 {
-			fatalf("cannot print header when selecting subparts")
-		}
-		s, err := mimeDecoder.DecodeHeader(msg.Header.Get(*printHeader))
+		s, err := mimeDecoder.DecodeHeader(target.header.Get(*printHeader))
 		if err != nil {
 			fatalf("decoding header %q failed: %v", *printHeader, err)
 		}
@@ -131,40 +126,38 @@ type mailPart struct {
 	body   io.Reader
 }
 
-// TODO: selectParts(part, spec) (parts, error)
-// errNotMultipart
-func selectParts(mr *multipart.Reader, spec string) ([]mailPart, error) {
+func selectParts(mp mailPart, spec string) ([]mailPart, error) {
 	var parts []mailPart
-	for {
-		p, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return nil, fmt.Errorf("reading multipart: %v", err)
-		}
 
-		ct := p.Header.Get("Content-Type")
-		debugf("selectParts: ct=%s", ct)
-		mt, params, err := mime.ParseMediaType(ct)
-		if err != nil {
-			return nil, fmt.Errorf("parsing content-type %q: %v", ct, err)
-		}
+	ct := mp.header.Get("Content-Type")
+	debugf("selectParts: ct=%s", ct)
+	mt, params, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return nil, fmt.Errorf("parsing content-type %q: %v", ct, err)
+	}
 
-		ok, err := testPattern(mt, spec)
+	ok, err := testPattern(mt, spec)
+	if err != nil {
+		return nil, err
+	}
+
+	if ok {
+		var buf bytes.Buffer
+		_, err := io.Copy(&buf, mp.body)
 		if err != nil {
 			return nil, err
 		}
-
-		if ok {
-			var buf bytes.Buffer
-			_, err := io.Copy(&buf, p)
-			if err != nil {
-				fatalf("%v", err)
+		parts = append(parts, mailPart{header: mp.header, body: &buf})
+	} else if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
+		mr := multipart.NewReader(mp.body, params["boundary"])
+		for {
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				return nil, fmt.Errorf("reading multipart: %v", err)
 			}
-			parts = append(parts, mailPart{header: mail.Header(p.Header), body: &buf})
-		} else if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
-			mr := multipart.NewReader(p, params["boundary"])
-			subparts, err := selectParts(mr, spec)
+			subparts, err := selectParts(mailPart{header: mail.Header(p.Header), body: p}, spec)
 			if err != nil {
 				return nil, err
 			}
