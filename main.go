@@ -38,31 +38,63 @@ func init() {
 	}
 }
 
+// --from, --subject, --html, --plain
 // --match-address From:...
 // --match-header Subject:...
 // --select-part text/html
+// --select-attachment application/pdf // TODO
 // --print-content
 // --print-json // TODO
-// --save-file '{{.Subject}}' // TODO
+// --save-file // TODO
 // --list-parts // ???
+// --debug, --quiet // TODO
 func main() {
-	matchAddress := flag.String("match-address", "", "Filter: address header `header:pattern` eg. \"From:*@example.com\"")
-	matchHeader := flag.String("match-header", "", "Filter: header `header:pattern` eg. \"Subject:foobar\"")
-	selectPart := flag.String("select-part", "", "Select: part by content type")
-	printContent := flag.Bool("print-content", false, "Action: print decoded content") // TODO: make default
-	printHeader := flag.String("print-header", "", "Action: print header")
+	var (
+		shortcutFrom    = flag.String("from", "", "Shortcut for --match-address 'From:`<pattern>`'")
+		shortcutSubject = flag.String("subject", "", "Shortcut for --match-header 'Subject:`<pattern>`'")
+		shortcutHTML    = flag.Bool("html", false, "Shortcut for --select-part text/html")
+		shortcutPlain   = flag.Bool("plain", false, "Shortcut for --select-part text/plain")
+
+		// TODO: make multiple
+		matchAddress = flag.String("match-address", "", "Filter: address header `<header>:<pattern>` eg. \"From:*@example.com\"")
+		matchHeader  = flag.String("match-header", "", "Filter: header `<header>:<pattern>` eg. \"Subject:foobar\"")
+
+		selectPart = flag.String("select-part", "", "Select: part by `<content-type>`")
+
+		printContent = flag.Bool("print-content", false, "Action: print decoded content (default behavior)")
+		printHeader  = flag.String("print-header", "", "Action: print header")
+	)
+
 	flag.CommandLine.SortFlags = false
 	flag.Parse()
 
 	msg, err := mail.ReadMessage(os.Stdin)
 	if err != nil {
-		log.Fatal(err)
+		fatalf("failed to read message: %v", err)
+	}
+
+	target := mailPart{
+		header: msg.Header,
+		body:   msg.Body,
 	}
 
 	pass := true
 
+	if *shortcutFrom != "" {
+		*matchAddress = "From:" + *shortcutFrom
+	}
+	if *shortcutSubject != "" {
+		*matchHeader = "Subject:" + *shortcutSubject
+	}
+	if *shortcutHTML == true {
+		*selectPart = "text/html"
+	}
+	if *shortcutPlain == true {
+		*selectPart = "text/plain"
+	}
+
 	if *matchAddress != "" {
-		ok, err := checkMatch(msg.Header, *matchAddress, true)
+		ok, err := checkMatch(target.header, *matchAddress, true)
 		if err != nil {
 			fatalf("checkMatch(%s): %v", *matchAddress, err)
 		}
@@ -72,7 +104,7 @@ func main() {
 	}
 
 	if *matchHeader != "" {
-		ok, err := checkMatch(msg.Header, *matchHeader, false)
+		ok, err := checkMatch(target.header, *matchHeader, false)
 		if err != nil {
 			fatalf("checkMatch(%s): %v", *matchHeader, err)
 		}
@@ -85,10 +117,9 @@ func main() {
 		fatalf("match failed")
 	}
 
-	// TODO: recurse
 	var parts []mailPart
 	if *selectPart != "" {
-		parts, err = selectParts(mailPart{header: msg.Header, body: msg.Body}, *selectPart)
+		parts, err = selectParts(target, *selectPart)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -97,15 +128,18 @@ func main() {
 		}
 	}
 
-	var target mailPart
 	if len(parts) > 0 {
+		// FIXME print all?
 		target = parts[0]
-	} else {
-		target = mailPart{header: msg.Header, body: msg.Body}
 	}
 
 	if strings.EqualFold(target.header.Get("Content-Transfer-Encoding"), "base64") {
 		target.body = base64.NewDecoder(base64.RawStdEncoding, target.body)
+	}
+
+	if *printHeader == "" {
+		// Default action
+		*printContent = true
 	}
 
 	if *printContent {
@@ -169,12 +203,14 @@ func selectParts(mp mailPart, spec string) ([]mailPart, error) {
 }
 
 func checkMatch(h mail.Header, in string, isAddr bool) (bool, error) {
+	// TODO: fail if header does not exist
 	p := strings.IndexByte(in, ':')
 	if p == -1 {
 		return false, fmt.Errorf("must be in the form of `header:pattern`: %q", in)
 	}
 	header, pattern := in[0:p], in[p+1:]
 
+	// TODO: use h.AddressList()
 	for _, value := range strings.Split(h.Get(header), ",") {
 		value, err := mimeDecoder.DecodeHeader(value)
 		if err != nil {
@@ -223,7 +259,7 @@ func testHeader(value, pattern string, isAddr bool) (bool, error) {
 }
 
 func testPattern(value, pattern string) (bool, error) {
-	if strings.IndexByte(pattern, '*') == -1 {
+	if strings.IndexByte(pattern, '*') == -1 && (pattern[0] != '/' && pattern[len(pattern)-1] != '/') {
 		return value == pattern, nil
 	}
 
