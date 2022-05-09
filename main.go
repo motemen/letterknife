@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/mail"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -38,17 +39,34 @@ func init() {
 	}
 }
 
+func extensionsByType(typ string) string {
+	switch typ {
+	case "text/html":
+		return ".html"
+	case "text/plain":
+		return ".txt"
+	}
+
+	exts, _ := mime.ExtensionsByType(typ)
+	if len(exts) > 0 {
+		return exts[0]
+	}
+
+	return ".bin"
+}
+
 // --from, --subject, --html, --plain
 // --match-address From:...
 // --match-header Subject:...
 // --select-part text/html
-// --select-attachment application/pdf // TODO
+// --select-attachment application/pdf
 // --print-content
 // --print-json // TODO
-// --save-file // TODO
+// --save-file
 // --list-parts // ???
 // --debug, --quiet // TODO
 func main() {
+	delmiter := "\n"
 	var (
 		shortcutFrom    = flag.String("from", "", "Shortcut for --match-address 'From:`<pattern>`'")
 		shortcutSubject = flag.String("subject", "", "Shortcut for --match-header 'Subject:`<pattern>`'")
@@ -59,23 +77,23 @@ func main() {
 		matchAddress = flag.String("match-address", "", "Filter: address header `<header>:<pattern>` eg. \"From:*@example.com\"")
 		matchHeader  = flag.String("match-header", "", "Filter: header `<header>:<pattern>` eg. \"Subject:foobar\"")
 
-		selectPart = flag.String("select-part", "", "Select: part by `<content-type>`")
+		selectPart       = flag.String("select-part", "", "Select: non-attachment parts by `<content-type>`")
+		selectAttachment = flag.String("select-attachment", "", "Select: attachments by `<content-type>`")
 
-		printContent = flag.Bool("print-content", false, "Action: print decoded content (default behavior)")
-		printHeader  = flag.String("print-header", "", "Action: print header")
+		printContent = flag.Bool("print-content", true, "Action: print decoded content")
+		printHeader  = flag.String("print-header", "", "Action: print `<header>`")
+		saveFile     = flag.Bool("save-file", false, "Action: save parts as files and print their paths")
 	)
 
 	flag.CommandLine.SortFlags = false
 	flag.Parse()
 
-	msg, err := mail.ReadMessage(os.Stdin)
+	// holds whole input
+	var in bytes.Buffer
+
+	msg, err := mail.ReadMessage(io.TeeReader(os.Stdin, &in))
 	if err != nil {
 		fatalf("failed to read message: %v", err)
-	}
-
-	target := mailPart{
-		header: msg.Header,
-		body:   msg.Body,
 	}
 
 	pass := true
@@ -94,7 +112,7 @@ func main() {
 	}
 
 	if *matchAddress != "" {
-		ok, err := checkMatch(target.header, *matchAddress, true)
+		ok, err := checkMatch(msg.Header, *matchAddress, true)
 		if err != nil {
 			fatalf("checkMatch(%s): %v", *matchAddress, err)
 		}
@@ -104,7 +122,7 @@ func main() {
 	}
 
 	if *matchHeader != "" {
-		ok, err := checkMatch(target.header, *matchHeader, false)
+		ok, err := checkMatch(msg.Header, *matchHeader, false)
 		if err != nil {
 			fatalf("checkMatch(%s): %v", *matchHeader, err)
 		}
@@ -117,73 +135,154 @@ func main() {
 		fatalf("match failed")
 	}
 
-	var parts []mailPart
+	wholePart := &mailPart{
+		header: msg.Header,
+		// special case: includes headers along with body
+		body:   &in,
+		isRoot: true,
+	}
+
+	rootPart, err := buildPartTree(msg.Header, msg.Body)
+	if err != nil {
+		fatalf("while building tree: %v", err)
+	}
+
+	var selectedParts []*mailPart
 	if *selectPart != "" {
-		parts, err = selectParts(target, *selectPart)
+		pp, err := selectParts(rootPart, *selectPart, false)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if len(parts) == 0 {
+		selectedParts = append(selectedParts, pp...)
+	}
+
+	if *selectAttachment != "" {
+		pp, err := selectParts(rootPart, *selectAttachment, true)
+		if err != nil {
+			log.Fatal(err)
+		}
+		selectedParts = append(selectedParts, pp...)
+	}
+
+	if *selectPart != "" || *selectAttachment != "" {
+		if len(selectedParts) == 0 {
 			fatalf("select failed")
 		}
+	} else {
+		selectedParts = []*mailPart{wholePart}
 	}
 
-	if len(parts) > 0 {
-		// FIXME print all?
-		target = parts[0]
-	}
-
-	if strings.EqualFold(target.header.Get("Content-Transfer-Encoding"), "base64") {
-		target.body = base64.NewDecoder(base64.RawStdEncoding, target.body)
-	}
-
-	if *printHeader == "" {
-		// Default action
-		*printContent = true
+	if *printHeader != "" || *saveFile {
+		*printContent = false
 	}
 
 	if *printContent {
-		_, _ = io.Copy(os.Stdout, target.body)
+		for _, mp := range selectedParts {
+			io.Copy(os.Stdout, mp.reader())
+			fmt.Print(delmiter)
+		}
 	}
 
 	if *printHeader != "" {
-		s, err := mimeDecoder.DecodeHeader(target.header.Get(*printHeader))
-		if err != nil {
-			fatalf("decoding header %q failed: %v", *printHeader, err)
+		for _, mp := range selectedParts {
+			s, err := mimeDecoder.DecodeHeader(mp.header.Get(*printHeader))
+			if err != nil {
+				fatalf("decoding header %q failed: %v", *printHeader, err)
+			}
+			fmt.Print(s)
+			fmt.Print(delmiter)
 		}
-		fmt.Println(s)
+	}
+
+	if *saveFile {
+		dir, err := os.MkdirTemp("", "")
+		if err != nil {
+			fatalf("while creating temporary directory: %v", err)
+		}
+
+		for _, mp := range selectedParts {
+			filename, _ := mp.attachmentFilename()
+
+			var f *os.File
+			if filename != "" {
+				path := filepath.Join(dir, filename)
+				f, err = os.Create(path)
+				if err != nil {
+					fatalf("creating file: %v", err)
+				}
+			} else {
+				ext := extensionsByType(mp.mediaType)
+				if mp.isRoot {
+					ext = ".eml"
+				}
+
+				f, err = os.CreateTemp(dir, "*"+ext)
+				if err != nil {
+					fatalf("creating file: %v", err)
+				}
+			}
+
+			io.Copy(f, mp.reader())
+			f.Close()
+			fmt.Print(f.Name())
+			fmt.Print(delmiter)
+		}
 	}
 }
 
 type mailPart struct {
-	header mail.Header
-	body   io.Reader
+	header    mail.Header
+	mediaType string
+
+	isRoot bool
+
+	// either is defined
+	body     *bytes.Buffer
+	subparts []*mailPart
+
+	disposition       string
+	dispositionParams map[string]string
 }
 
-func selectParts(mp mailPart, spec string) ([]mailPart, error) {
-	var parts []mailPart
+func (m *mailPart) isMultipart() bool {
+	return m.body == nil
+}
 
-	ct := mp.header.Get("Content-Type")
-	debugf("selectParts: ct=%s", ct)
+func (m *mailPart) attachmentFilename() (string, bool) {
+	if m.disposition != "attachment" {
+		return "", false
+	}
+	return m.dispositionParams["filename"], true
+}
+
+func (m *mailPart) reader() io.Reader {
+	if m.isRoot {
+		return m.body
+	}
+
+	if strings.EqualFold(m.header.Get("Content-Transfer-Encoding"), "base64") {
+		return base64.NewDecoder(base64.RawStdEncoding, m.body)
+	}
+
+	return m.body
+}
+
+func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
+	ct := header.Get("Content-Type")
+	debugf("buildPartTree: ct=%s", ct)
+
 	mt, params, err := mime.ParseMediaType(ct)
 	if err != nil {
 		return nil, fmt.Errorf("parsing content-type %q: %v", ct, err)
 	}
 
-	ok, err := testPattern(mt, spec)
-	if err != nil {
-		return nil, err
+	part := mailPart{
+		header:    header,
+		mediaType: mt,
 	}
 
-	if ok {
-		var buf bytes.Buffer
-		_, err := io.Copy(&buf, mp.body)
-		if err != nil {
-			return nil, err
-		}
-		parts = append(parts, mailPart{header: mp.header, body: &buf})
-	} else if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
-		mr := multipart.NewReader(mp.body, params["boundary"])
+	if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
+		mr := multipart.NewReader(body, params["boundary"])
 		for {
 			p, err := mr.NextPart()
 			if err == io.EOF {
@@ -191,14 +290,56 @@ func selectParts(mp mailPart, spec string) ([]mailPart, error) {
 			} else if err != nil {
 				return nil, fmt.Errorf("reading multipart: %v", err)
 			}
-			subparts, err := selectParts(mailPart{header: mail.Header(p.Header), body: p}, spec)
+			subpart, err := buildPartTree(mail.Header(p.Header), p)
 			if err != nil {
 				return nil, err
 			}
-			parts = append(parts, subparts...)
+			part.subparts = append(part.subparts, subpart)
 		}
+		return &part, nil
 	}
 
+	part.disposition, part.dispositionParams, err = mime.ParseMediaType(header.Get("Content-Disposition"))
+	_ = err // discard
+	part.body = new(bytes.Buffer)
+	_, err = io.Copy(part.body, body)
+	return &part, err
+}
+
+func visitParts(mp *mailPart, visit func(*mailPart) error) error {
+	debugf("visitParts: ct=%v mp=%v", mp.header.Get("Content-Type"), mp.isMultipart())
+
+	if mp.isMultipart() {
+		for _, p := range mp.subparts {
+			if err := visitParts(p, visit); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return visit(mp)
+}
+
+func selectParts(mp *mailPart, mediaTypeSpec string, isAttachmentSpec bool) ([]*mailPart, error) {
+	parts := []*mailPart{}
+	visitParts(mp, func(mp *mailPart) error {
+		_, isAttachment := mp.attachmentFilename()
+		if isAttachment != isAttachmentSpec {
+			return nil
+		}
+
+		ok, err := testPattern(mp.mediaType, mediaTypeSpec)
+		if err != nil {
+			return err
+		}
+
+		if ok {
+			parts = append(parts, mp)
+		}
+
+		return nil
+	})
 	return parts, nil
 }
 
