@@ -18,8 +18,12 @@ import (
 	"golang.org/x/text/encoding/ianaindex"
 )
 
+var modeDebug bool
+
 func debugf(format string, args ...interface{}) {
-	log.Printf("debug: "+format, args...)
+	if modeDebug {
+		log.Printf("debug: "+format, args...)
+	}
 }
 
 func fatalf(format string, args ...interface{}) {
@@ -85,6 +89,8 @@ func main() {
 		saveFile     = flag.Bool("save-file", false, "Action: save parts as files and print their paths")
 	)
 
+	flag.BoolVar(&modeDebug, "debug", false, "enable debug logging")
+
 	flag.CommandLine.SortFlags = false
 	flag.Parse()
 
@@ -104,10 +110,10 @@ func main() {
 	if *shortcutSubject != "" {
 		*matchHeader = "Subject:" + *shortcutSubject
 	}
-	if *shortcutHTML == true {
+	if *shortcutHTML {
 		*selectPart = "text/html"
 	}
-	if *shortcutPlain == true {
+	if *shortcutPlain {
 		*selectPart = "text/plain"
 	}
 
@@ -269,7 +275,6 @@ func (m *mailPart) reader() io.Reader {
 
 func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
 	ct := header.Get("Content-Type")
-	debugf("buildPartTree: ct=%s", ct)
 
 	mt, params, err := mime.ParseMediaType(ct)
 	if err != nil {
@@ -307,7 +312,7 @@ func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
 }
 
 func visitParts(mp *mailPart, visit func(*mailPart) error) error {
-	debugf("visitParts: ct=%v mp=%v", mp.header.Get("Content-Type"), mp.isMultipart())
+	debugf("visitParts: %v sub=%v", mp.header.Get("Content-Type"), mp.subparts)
 
 	if mp.isMultipart() {
 		for _, p := range mp.subparts {
@@ -323,7 +328,7 @@ func visitParts(mp *mailPart, visit func(*mailPart) error) error {
 
 func selectParts(mp *mailPart, mediaTypeSpec string, isAttachmentSpec bool) ([]*mailPart, error) {
 	parts := []*mailPart{}
-	visitParts(mp, func(mp *mailPart) error {
+	err := visitParts(mp, func(mp *mailPart) error {
 		_, isAttachment := mp.attachmentFilename()
 		if isAttachment != isAttachmentSpec {
 			return nil
@@ -340,6 +345,10 @@ func selectParts(mp *mailPart, mediaTypeSpec string, isAttachmentSpec bool) ([]*
 
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	return parts, nil
 }
 
