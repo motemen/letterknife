@@ -86,6 +86,7 @@ func main() {
 
 		printContent = flag.Bool("print-content", true, "Action: print decoded content")
 		printHeader  = flag.String("print-header", "", "Action: print `<header>`")
+		printRaw     = flag.Bool("print-raw", false, "Action: print raw input as-is")
 		saveFile     = flag.Bool("save-file", false, "Action: save parts as files and print their paths")
 	)
 
@@ -138,14 +139,13 @@ func main() {
 	}
 
 	if !pass {
-		fatalf("match failed")
+		fatalf("matching header failed")
 	}
 
 	wholePart := &mailPart{
 		header: msg.Header,
 		// special case: includes headers along with body
-		body:   &in,
-		isRoot: true,
+		body: &in,
 	}
 
 	rootPart, err := buildPartTree(msg.Header, msg.Body)
@@ -172,20 +172,30 @@ func main() {
 
 	if *selectPart != "" || *selectAttachment != "" {
 		if len(selectedParts) == 0 {
-			fatalf("select failed")
+			fatalf("selecting parts failed")
 		}
 	} else {
 		selectedParts = []*mailPart{wholePart}
 	}
 
-	if *printHeader != "" || *saveFile {
+	if *printHeader != "" || *saveFile || *printRaw {
 		*printContent = false
 	}
 
 	if *printContent {
 		for _, mp := range selectedParts {
-			io.Copy(os.Stdout, mp.reader())
+			_, err = io.Copy(os.Stdout, mp)
+			if err != nil {
+				fatalf("%v", err)
+			}
 			fmt.Print(delmiter)
+		}
+	}
+
+	if *printRaw {
+		_, err = io.Copy(os.Stdout, &in)
+		if err != nil {
+			fatalf("%v", err)
 		}
 	}
 
@@ -218,7 +228,7 @@ func main() {
 				}
 			} else {
 				ext := extensionsByType(mp.mediaType)
-				if mp.isRoot {
+				if mp == wholePart {
 					ext = ".eml"
 				}
 
@@ -228,7 +238,11 @@ func main() {
 				}
 			}
 
-			io.Copy(f, mp.reader())
+			_, err = io.Copy(f, mp)
+			if err != nil {
+				fatalf("%v", err)
+			}
+
 			f.Close()
 			fmt.Print(f.Name())
 			fmt.Print(delmiter)
@@ -237,10 +251,11 @@ func main() {
 }
 
 type mailPart struct {
-	header    mail.Header
-	mediaType string
+	header          mail.Header
+	mediaType       string
+	mediaTypeParams map[string]string
 
-	isRoot bool
+	r io.Reader
 
 	// either is defined
 	body     *bytes.Buffer
@@ -248,6 +263,30 @@ type mailPart struct {
 
 	disposition       string
 	dispositionParams map[string]string
+}
+
+// Read implements io.Reader
+func (m *mailPart) Read(p []byte) (n int, err error) {
+	if m.r == nil {
+		var r io.Reader = m.body
+
+		if strings.EqualFold(m.header.Get("Content-Transfer-Encoding"), "base64") {
+			r = base64.NewDecoder(base64.StdEncoding, r)
+		}
+
+		if charset := m.mediaTypeParams["charset"]; charset != "" {
+			enc, err := ianaindex.MIME.Encoding(charset)
+			if err != nil {
+				return 0, fmt.Errorf("failed to build charset %q decoder: %v", charset, err)
+			}
+
+			r = enc.NewDecoder().Reader(r)
+		}
+
+		m.r = r
+	}
+
+	return m.r.Read(p)
 }
 
 func (m *mailPart) isMultipart() bool {
@@ -261,17 +300,7 @@ func (m *mailPart) attachmentFilename() (string, bool) {
 	return m.dispositionParams["filename"], true
 }
 
-func (m *mailPart) reader() io.Reader {
-	if m.isRoot {
-		return m.body
-	}
-
-	if strings.EqualFold(m.header.Get("Content-Transfer-Encoding"), "base64") {
-		return base64.NewDecoder(base64.RawStdEncoding, m.body)
-	}
-
-	return m.body
-}
+var _ io.Reader = (*mailPart)(nil)
 
 func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
 	ct := header.Get("Content-Type")
@@ -282,8 +311,9 @@ func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
 	}
 
 	part := mailPart{
-		header:    header,
-		mediaType: mt,
+		header:          header,
+		mediaType:       mt,
+		mediaTypeParams: params,
 	}
 
 	if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
@@ -295,6 +325,7 @@ func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
 			} else if err != nil {
 				return nil, fmt.Errorf("reading multipart: %v", err)
 			}
+
 			subpart, err := buildPartTree(mail.Header(p.Header), p)
 			if err != nil {
 				return nil, err
@@ -304,8 +335,7 @@ func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
 		return &part, nil
 	}
 
-	part.disposition, part.dispositionParams, err = mime.ParseMediaType(header.Get("Content-Disposition"))
-	_ = err // discard
+	part.disposition, part.dispositionParams, _ = mime.ParseMediaType(header.Get("Content-Disposition"))
 	part.body = new(bytes.Buffer)
 	_, err = io.Copy(part.body, body)
 	return &part, err
@@ -360,14 +390,29 @@ func checkMatch(h mail.Header, in string, isAddr bool) (bool, error) {
 	}
 	header, pattern := in[0:p], in[p+1:]
 
-	// TODO: use h.AddressList()
-	for _, value := range strings.Split(h.Get(header), ",") {
+	var values []string
+	if isAddr {
+		addrs, err := (&mail.AddressParser{WordDecoder: mimeDecoder}).ParseList(h.Get(header))
+		if err != nil {
+			return false, fmt.Errorf("parsing header %s: as addresses: %v", header, err)
+		}
+		values = make([]string, len(addrs))
+		for i, addr := range addrs {
+			values[i] = addr.Address
+		}
+	} else {
+		values = []string{h.Get(header)}
+	}
+
+	for _, value := range values {
 		value, err := mimeDecoder.DecodeHeader(value)
 		if err != nil {
 			return false, err
 		}
+
 		debugf("test %s: %q against %q", header, value, pattern)
-		ok, err := testHeader(value, pattern, isAddr)
+
+		ok, err := testPattern(value, pattern)
 		if err != nil {
 			return false, err
 		}
@@ -394,18 +439,6 @@ func regexpFromPattern(pattern string) (*regexp.Regexp, error) {
 		}
 	})
 	return regexp.Compile("^" + p + "$")
-}
-
-func testHeader(value, pattern string, isAddr bool) (bool, error) {
-	if isAddr {
-		addr, err := mail.ParseAddress(value)
-		if err != nil {
-			return false, fmt.Errorf("parsing address %q: %w", value, err)
-		}
-		value = addr.Address
-	}
-
-	return testPattern(value, pattern)
 }
 
 func testPattern(value, pattern string) (bool, error) {
