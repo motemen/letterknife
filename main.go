@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	flag "github.com/spf13/pflag"
@@ -25,6 +26,8 @@ func (lk *LetterKnife) debugf(format string, args ...interface{}) {
 }
 
 func fatalf(format string, args ...interface{}) {
+	_, file, line, _ := runtime.Caller(1)
+	log.Printf("%s:%d", file, line)
 	log.Printf("fatal: "+format, args...)
 	os.Exit(1)
 }
@@ -84,27 +87,27 @@ type LetterKnife struct {
 	ModeDebug bool
 }
 
-func (l *LetterKnife) ParseFlags(args []string) error {
+func (lk *LetterKnife) ParseFlags(args []string) error {
 	flags := flag.NewFlagSet("letterknife", flag.ExitOnError)
 
-	flags.StringVar(&l.ShortcutFrom, "from", "", "Shortcut for --match-address 'From:`<pattern>`'")
-	flags.StringVar(&l.ShortcutSubject, "subject", "", "Shortcut for --match-header 'Subject:`<pattern>`'")
-	flags.BoolVar(&l.ShortcutHTML, "html", false, "Shortcut for --select-part text/html")
-	flags.BoolVar(&l.ShortcutPlain, "plain", false, "Shortcut for --select-part text/plain")
+	flags.StringVar(&lk.ShortcutFrom, "from", "", "Shortcut for --match-address 'From:`<pattern>`'")
+	flags.StringVar(&lk.ShortcutSubject, "subject", "", "Shortcut for --match-header 'Subject:`<pattern>`'")
+	flags.BoolVar(&lk.ShortcutHTML, "html", false, "Shortcut for --select-part text/html")
+	flags.BoolVar(&lk.ShortcutPlain, "plain", false, "Shortcut for --select-part text/plain")
 
 	// TODO: make multiple
-	flags.StringVar(&l.MatchAddress, "match-address", "", "Filter: address header `<header>:<pattern>` eg. \"From:*@example.com\"")
-	flags.StringVar(&l.MatchHeader, "match-header", "", "Filter: header `<header>:<pattern>` eg. \"Subject:foobar\"")
+	flags.StringVar(&lk.MatchAddress, "match-address", "", "Filter: address header `<header>:<pattern>` eg. \"From:*@example.com\"")
+	flags.StringVar(&lk.MatchHeader, "match-header", "", "Filter: header `<header>:<pattern>` eg. \"Subject:foobar\"")
 
-	flags.StringVar(&l.SelectPart, "select-part", "", "Select: non-attachment parts by `<content-type>`")
-	flags.StringVar(&l.SelectAttachment, "select-attachment", "", "Select: attachments by `<content-type>`")
+	flags.StringVar(&lk.SelectPart, "select-part", "", "Select: non-attachment parts by `<content-type>`")
+	flags.StringVar(&lk.SelectAttachment, "select-attachment", "", "Select: attachments by `<content-type>`")
 
-	flags.BoolVar(&l.PrintContent, "print-content", true, "Action: print decoded content")
-	flags.StringVar(&l.PrintHeader, "print-header", "", "Action: print `<header>`")
-	flags.BoolVar(&l.PrintRaw, "print-raw", false, "Action: print raw input as-is")
-	flags.BoolVar(&l.SaveFile, "save-file", false, "Action: save parts as files and print their paths")
+	flags.BoolVar(&lk.PrintContent, "print-content", true, "Action: print decoded content")
+	flags.StringVar(&lk.PrintHeader, "print-header", "", "Action: print `<header>`")
+	flags.BoolVar(&lk.PrintRaw, "print-raw", false, "Action: print raw input as-is")
+	flags.BoolVar(&lk.SaveFile, "save-file", false, "Action: save parts as files and print their paths")
 
-	flags.BoolVar(&l.ModeDebug, "debug", false, "enable debug logging")
+	flags.BoolVar(&lk.ModeDebug, "debug", false, "enable debug logging")
 
 	flags.SortFlags = false
 
@@ -186,10 +189,19 @@ func (lk *LetterKnife) Run() {
 		fatalf("matching header failed")
 	}
 
-	wholePart := &mailPart{
+	// TODO: newMessagePart()
+	ct := msg.Header.Get("Content-Type")
+	mt, params, err := mime.ParseMediaType(ct)
+	if err != nil {
+		fatalf("parsing content-type %q: %v", ct, err)
+	}
+
+	wholePart := &messagePart{
 		header: msg.Header,
 		// special case: includes headers along with body
-		body: &in,
+		body:            &in,
+		mediaType:       mt,
+		mediaTypeParams: params,
 	}
 
 	rootPart, err := buildPartTree(msg.Header, msg.Body)
@@ -197,7 +209,7 @@ func (lk *LetterKnife) Run() {
 		fatalf("while building tree: %v", err)
 	}
 
-	var selectedParts []*mailPart
+	var selectedParts []*messagePart
 	if lk.SelectPart != "" {
 		pp, err := lk.selectParts(rootPart, lk.SelectPart, false)
 		if err != nil {
@@ -218,12 +230,21 @@ func (lk *LetterKnife) Run() {
 		if len(selectedParts) == 0 {
 			fatalf("selecting parts failed")
 		}
-	} else {
-		selectedParts = []*mailPart{wholePart}
 	}
 
 	if lk.PrintHeader != "" || lk.SaveFile || lk.PrintRaw {
 		lk.PrintContent = false
+	}
+
+	// If no part is selected and --print-content is specified,
+	// then it should be treated as --print-raw.
+	if len(selectedParts) == 0 && lk.PrintContent {
+		lk.PrintContent = false
+		lk.PrintRaw = true
+	}
+
+	if len(selectedParts) == 0 {
+		selectedParts = []*messagePart{wholePart}
 	}
 
 	if lk.PrintContent {
@@ -294,7 +315,7 @@ func (lk *LetterKnife) Run() {
 	}
 }
 
-type mailPart struct {
+type messagePart struct {
 	header          mail.Header
 	mediaType       string
 	mediaTypeParams map[string]string
@@ -303,14 +324,31 @@ type mailPart struct {
 
 	// either is defined
 	body     *bytes.Buffer
-	subparts []*mailPart
+	subparts []*messagePart
 
 	disposition       string
 	dispositionParams map[string]string
 }
 
+type errWrappedReader struct {
+	message string
+	r       io.Reader
+}
+
 // Read implements io.Reader
-func (m *mailPart) Read(p []byte) (n int, err error) {
+func (r *errWrappedReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if err == io.EOF {
+		return n, err
+	} else if err != nil {
+		return n, fmt.Errorf("%s: %w", r.message, err)
+	}
+
+	return n, nil
+}
+
+// Read implements io.Reader
+func (m *messagePart) Read(p []byte) (n int, err error) {
 	if m.r == nil {
 		var r io.Reader = m.body
 
@@ -325,6 +363,10 @@ func (m *mailPart) Read(p []byte) (n int, err error) {
 			}
 
 			r = enc.NewDecoder().Reader(r)
+			r = &errWrappedReader{
+				message: "decoding " + charset,
+				r:       r,
+			}
 		}
 
 		m.r = r
@@ -333,26 +375,25 @@ func (m *mailPart) Read(p []byte) (n int, err error) {
 	return m.r.Read(p)
 }
 
-func (m *mailPart) isMultipart() bool {
+func (m *messagePart) isMultipart() bool {
 	return m.body == nil
 }
 
-func (m *mailPart) attachmentFilename() (string, bool) {
+func (m *messagePart) attachmentFilename() (string, bool) {
 	if m.disposition != "attachment" {
 		return "", false
 	}
 	return m.dispositionParams["filename"], true
 }
 
-func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
+func buildPartTree(header mail.Header, body io.Reader) (*messagePart, error) {
 	ct := header.Get("Content-Type")
-
 	mt, params, err := mime.ParseMediaType(ct)
 	if err != nil {
 		return nil, fmt.Errorf("parsing content-type %q: %v", ct, err)
 	}
 
-	part := mailPart{
+	part := messagePart{
 		header:          header,
 		mediaType:       mt,
 		mediaTypeParams: params,
@@ -383,7 +424,7 @@ func buildPartTree(header mail.Header, body io.Reader) (*mailPart, error) {
 	return &part, err
 }
 
-func (lk *LetterKnife) visitParts(mp *mailPart, visit func(*mailPart) error) error {
+func (lk *LetterKnife) visitParts(mp *messagePart, visit func(*messagePart) error) error {
 	lk.debugf("visitParts: %v sub=%v", mp.header.Get("Content-Type"), mp.subparts)
 
 	if mp.isMultipart() {
@@ -398,9 +439,9 @@ func (lk *LetterKnife) visitParts(mp *mailPart, visit func(*mailPart) error) err
 	return visit(mp)
 }
 
-func (lk *LetterKnife) selectParts(mp *mailPart, mediaTypeSpec string, isAttachmentSpec bool) ([]*mailPart, error) {
-	parts := []*mailPart{}
-	err := lk.visitParts(mp, func(mp *mailPart) error {
+func (lk *LetterKnife) selectParts(mp *messagePart, mediaTypeSpec string, isAttachmentSpec bool) ([]*messagePart, error) {
+	parts := []*messagePart{}
+	err := lk.visitParts(mp, func(mp *messagePart) error {
 		_, isAttachment := mp.attachmentFilename()
 		if isAttachment != isAttachmentSpec {
 			return nil
