@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 
 	flag "github.com/spf13/pflag"
@@ -26,8 +25,6 @@ func (lk *LetterKnife) debugf(format string, args ...interface{}) {
 }
 
 func fatalf(format string, args ...interface{}) {
-	_, file, line, _ := runtime.Caller(1)
-	log.Printf("%s:%d", file, line)
 	log.Printf("fatal: "+format, args...)
 	os.Exit(1)
 }
@@ -189,20 +186,14 @@ func (lk *LetterKnife) Run() {
 		fatalf("matching header failed")
 	}
 
-	// TODO: newMessagePart()
-	ct := msg.Header.Get("Content-Type")
-	mt, params, err := mime.ParseMediaType(ct)
+	wholePart, err := newMessagePartFromHeader(msg.Header)
 	if err != nil {
-		fatalf("parsing content-type %q: %v", ct, err)
+		fatalf("failed to create part: %v", err)
 	}
 
-	wholePart := &messagePart{
-		header: msg.Header,
-		// special case: includes headers along with body
-		body:            &in,
-		mediaType:       mt,
-		mediaTypeParams: params,
-	}
+	// special case: includes headers along with body
+	// body not set, but r is set
+	wholePart.r = &in
 
 	rootPart, err := buildPartTree(msg.Header, msg.Body)
 	if err != nil {
@@ -386,21 +377,28 @@ func (m *messagePart) attachmentFilename() (string, bool) {
 	return m.dispositionParams["filename"], true
 }
 
-func buildPartTree(header mail.Header, body io.Reader) (*messagePart, error) {
+func newMessagePartFromHeader(header mail.Header) (*messagePart, error) {
 	ct := header.Get("Content-Type")
 	mt, params, err := mime.ParseMediaType(ct)
 	if err != nil {
 		return nil, fmt.Errorf("parsing content-type %q: %v", ct, err)
 	}
 
-	part := messagePart{
+	return &messagePart{
 		header:          header,
 		mediaType:       mt,
 		mediaTypeParams: params,
+	}, nil
+}
+
+func buildPartTree(header mail.Header, body io.Reader) (*messagePart, error) {
+	part, err := newMessagePartFromHeader(header)
+	if err != nil {
+		return nil, err
 	}
 
-	if strings.HasPrefix(mt, "multipart/") && params["boundary"] != "" {
-		mr := multipart.NewReader(body, params["boundary"])
+	if strings.HasPrefix(part.mediaType, "multipart/") && part.mediaTypeParams["boundary"] != "" {
+		mr := multipart.NewReader(body, part.mediaTypeParams["boundary"])
 		for {
 			p, err := mr.NextPart()
 			if err == io.EOF {
@@ -415,13 +413,13 @@ func buildPartTree(header mail.Header, body io.Reader) (*messagePart, error) {
 			}
 			part.subparts = append(part.subparts, subpart)
 		}
-		return &part, nil
+		return part, nil
 	}
 
 	part.disposition, part.dispositionParams, _ = mime.ParseMediaType(header.Get("Content-Disposition"))
 	part.body = new(bytes.Buffer)
 	_, err = io.Copy(part.body, body)
-	return &part, err
+	return part, err
 }
 
 func (lk *LetterKnife) visitParts(mp *messagePart, visit func(*messagePart) error) error {
