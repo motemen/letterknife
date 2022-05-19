@@ -225,7 +225,7 @@ func (lk *LetterKnife) Run(r io.Reader, w io.Writer) error {
 		}
 	}
 
-	if lk.PrintHeader == "" || !lk.SaveFile || !lk.PrintRaw {
+	if lk.PrintHeader == "" && !lk.SaveFile && !lk.PrintRaw {
 		lk.PrintContent = true
 	}
 
