@@ -11,25 +11,27 @@ import (
 	"gotest.tools/v3/assert/cmp"
 )
 
-func runLetterKnife(t *testing.T, args []string, filename string) *bytes.Buffer {
+func runLetterKnife(t *testing.T, args []string, filename string) (*bytes.Buffer, error) {
 	f, err := os.Open(filepath.Join("testdata", filename))
 	assert.NilError(t, err)
 
 	var buf bytes.Buffer
-	lk := LetterKnife{In: f, Out: &buf}
+	lk := LetterKnife{}
 	err = lk.ParseFlags(args)
 	assert.NilError(t, err)
 
-	lk.Run()
+	err = lk.Run(f, &buf)
 
-	return &buf
+	return &buf, err
 }
 
 func TestRunMain_PrintContent(t *testing.T) {
-	out := runLetterKnife(t, []string{"--plain"}, "multipart.eml")
+	out, err := runLetterKnife(t, []string{"--plain"}, "multipart.eml")
+	assert.NilError(t, err)
 	assert.Check(t, cmp.Contains(out.String(), "Hello! 😊"))
 
-	out = runLetterKnife(t, []string{}, "plain.eml")
+	out, err = runLetterKnife(t, []string{}, "plain.eml")
+	assert.NilError(t, err)
 	in, err := os.ReadFile("testdata/plain.eml")
 	assert.NilError(t, err)
 	assert.Check(t, cmp.Equal(string(in), out.String()))
@@ -37,7 +39,8 @@ func TestRunMain_PrintContent(t *testing.T) {
 
 func TestRunMain_SaveFile(t *testing.T) {
 	t.Run("saves as .eml when no part selected", func(t *testing.T) {
-		out := runLetterKnife(t, []string{"--save-file"}, "plain.eml")
+		out, err := runLetterKnife(t, []string{"--save-file"}, "plain.eml")
+		assert.NilError(t, err)
 		assert.Check(t, cmp.Regexp(`(?m)\.eml$`, out.String()))
 
 		source, err := os.ReadFile("testdata/plain.eml")
@@ -50,17 +53,31 @@ func TestRunMain_SaveFile(t *testing.T) {
 	})
 
 	t.Run("saves as .html and .txt", func(t *testing.T) {
-		buf := runLetterKnife(t, []string{"--select-part=*", "--save-file"}, "multipart.eml")
+		buf, err := runLetterKnife(t, []string{"--select-part=*", "--save-file"}, "multipart.eml")
+		assert.NilError(t, err)
 		lines := buf.String()
 		assert.Check(t, cmp.Regexp(`(?m)\.txt$`, lines))
 		assert.Check(t, cmp.Regexp(`(?m)\.html$`, lines))
 	})
 
 	t.Run("saves attachment with original filename", func(t *testing.T) {
-		buf := runLetterKnife(t, []string{"--select-attachment=*", "--save-file"}, "multipart.eml")
+		buf, err := runLetterKnife(t, []string{"--select-attachment=*", "--save-file"}, "multipart.eml")
+		assert.NilError(t, err)
 		lines := buf.String()
 		assert.Check(t, cmp.Regexp(`(?m)4x4\.png$`, lines))
 	})
+}
+
+func TestRunMain_MatchHeader(t *testing.T) {
+	_, err := runLetterKnife(t, []string{"--match-header", "Subject:*mail ✉️"}, "plain.eml")
+	assert.NilError(t, err)
+	_, err = runLetterKnife(t, []string{"--match-header", "Subject:Hello️"}, "plain.eml")
+	assert.ErrorIs(t, err, ErrHeaderMatchFailed)
+}
+
+func TestRunMain_MatchAddress(t *testing.T) {
+	_, err := runLetterKnife(t, []string{"--from", "motemen@gmail.com"}, "plain.eml")
+	assert.NilError(t, err)
 }
 
 func TestRegexpFromPattern(t *testing.T) {

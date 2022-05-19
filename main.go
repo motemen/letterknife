@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,6 +29,11 @@ func fatalf(format string, args ...interface{}) {
 	log.Printf("fatal: "+format, args...)
 	os.Exit(1)
 }
+
+var (
+	ErrHeaderMatchFailed = errors.New("header match failed")
+	ErrSelectFailed      = errors.New("no part selected")
+)
 
 var mimeDecoder = new(mime.WordDecoder)
 
@@ -61,9 +67,6 @@ var delmiter = "\n"
 
 type LetterKnife struct {
 	Delmiter string
-
-	In  io.Reader
-	Out io.Writer
 
 	ShortcutFrom    string
 	ShortcutSubject string
@@ -99,7 +102,7 @@ func (lk *LetterKnife) ParseFlags(args []string) error {
 	flags.StringVar(&lk.SelectPart, "select-part", "", "Select: non-attachment parts by `<content-type>`")
 	flags.StringVar(&lk.SelectAttachment, "select-attachment", "", "Select: attachments by `<content-type>`")
 
-	flags.BoolVar(&lk.PrintContent, "print-content", true, "Action: print decoded content")
+	flags.BoolVar(&lk.PrintContent, "print-content", false, "Action: print decoded content")
 	flags.StringVar(&lk.PrintHeader, "print-header", "", "Action: print `<header>`")
 	flags.BoolVar(&lk.PrintRaw, "print-raw", false, "Action: print raw input as-is")
 	flags.BoolVar(&lk.SaveFile, "save-file", false, "Action: save parts as files and print their paths")
@@ -107,6 +110,8 @@ func (lk *LetterKnife) ParseFlags(args []string) error {
 	flags.BoolVar(&lk.ModeDebug, "debug", false, "enable debug logging")
 
 	flags.SortFlags = false
+
+	lk.Delmiter = "\n"
 
 	return flags.Parse(args)
 }
@@ -123,28 +128,25 @@ func (lk *LetterKnife) ParseFlags(args []string) error {
 // --debug, --quiet // TODO
 func main() {
 	l := &LetterKnife{}
-	l.Delmiter = "\n"
-	l.In = os.Stdin
-	l.Out = os.Stdout
 
 	err := l.ParseFlags(os.Args[1:])
 	if err != nil {
 		fatalf("%v", err)
 	}
 
-	l.Run()
+	err = l.Run(os.Stdin, os.Stdout)
+	if err != nil {
+		fatalf("%v", err)
+	}
 }
 
-func (lk *LetterKnife) Run() {
-	r := lk.In
-	w := lk.Out
-
+func (lk *LetterKnife) Run(r io.Reader, w io.Writer) error {
 	// holds whole input
 	var in bytes.Buffer
 
 	msg, err := mail.ReadMessage(io.TeeReader(r, &in))
 	if err != nil {
-		fatalf("failed to read message: %v", err)
+		return fmt.Errorf("failed to read message: %w", err)
 	}
 
 	pass := true
@@ -165,7 +167,7 @@ func (lk *LetterKnife) Run() {
 	if lk.MatchAddress != "" {
 		ok, err := lk.checkMatch(msg.Header, lk.MatchAddress, true)
 		if err != nil {
-			fatalf("checkMatch(%s): %v", lk.MatchAddress, err)
+			return fmt.Errorf("checkMatch(%s): %w", lk.MatchAddress, err)
 		}
 		if !ok {
 			pass = false
@@ -175,7 +177,7 @@ func (lk *LetterKnife) Run() {
 	if lk.MatchHeader != "" {
 		ok, err := lk.checkMatch(msg.Header, lk.MatchHeader, false)
 		if err != nil {
-			fatalf("checkMatch(%s): %v", lk.MatchHeader, err)
+			return fmt.Errorf("checkMatch(%s): %w", lk.MatchHeader, err)
 		}
 		if !ok {
 			pass = false
@@ -183,12 +185,12 @@ func (lk *LetterKnife) Run() {
 	}
 
 	if !pass {
-		fatalf("matching header failed")
+		return ErrHeaderMatchFailed
 	}
 
 	wholePart, err := newMessagePartFromHeader(msg.Header)
 	if err != nil {
-		fatalf("failed to create part: %v", err)
+		return fmt.Errorf("failed to create part: %w", err)
 	}
 
 	// special case: includes headers along with body
@@ -197,14 +199,14 @@ func (lk *LetterKnife) Run() {
 
 	rootPart, err := buildPartTree(msg.Header, msg.Body)
 	if err != nil {
-		fatalf("while building tree: %v", err)
+		return fmt.Errorf("while building tree: %w", err)
 	}
 
 	var selectedParts []*messagePart
 	if lk.SelectPart != "" {
 		pp, err := lk.selectParts(rootPart, lk.SelectPart, false)
 		if err != nil {
-			fatalf("%v", err)
+			return fmt.Errorf("while selecting parts: %w", err)
 		}
 		selectedParts = append(selectedParts, pp...)
 	}
@@ -212,19 +214,19 @@ func (lk *LetterKnife) Run() {
 	if lk.SelectAttachment != "" {
 		pp, err := lk.selectParts(rootPart, lk.SelectAttachment, true)
 		if err != nil {
-			fatalf("%v", err)
+			return fmt.Errorf("while selecting attachments: %w", err)
 		}
 		selectedParts = append(selectedParts, pp...)
 	}
 
 	if lk.SelectPart != "" || lk.SelectAttachment != "" {
 		if len(selectedParts) == 0 {
-			fatalf("selecting parts failed")
+			return ErrSelectFailed
 		}
 	}
 
-	if lk.PrintHeader != "" || lk.SaveFile || lk.PrintRaw {
-		lk.PrintContent = false
+	if lk.PrintHeader == "" || !lk.SaveFile || !lk.PrintRaw {
+		lk.PrintContent = true
 	}
 
 	// If no part is selected and --print-content is specified,
@@ -238,11 +240,20 @@ func (lk *LetterKnife) Run() {
 		selectedParts = []*messagePart{wholePart}
 	}
 
+	if lk.PrintHeader != "" {
+		s, err := mimeDecoder.DecodeHeader(wholePart.header.Get(lk.PrintHeader))
+		if err != nil {
+			return fmt.Errorf("decoding header %q failed: %w", lk.PrintHeader, err)
+		}
+		fmt.Fprint(w, s)
+		fmt.Fprint(w, delmiter)
+	}
+
 	if lk.PrintContent {
 		for _, mp := range selectedParts {
 			_, err = io.Copy(w, mp)
 			if err != nil {
-				fatalf("%v", err)
+				return err
 			}
 			fmt.Fprint(w, delmiter)
 		}
@@ -251,25 +262,14 @@ func (lk *LetterKnife) Run() {
 	if lk.PrintRaw {
 		_, err = io.Copy(w, &in)
 		if err != nil {
-			fatalf("%v", err)
-		}
-	}
-
-	if lk.PrintHeader != "" {
-		for _, mp := range selectedParts {
-			s, err := mimeDecoder.DecodeHeader(mp.header.Get(lk.PrintHeader))
-			if err != nil {
-				fatalf("decoding header %q failed: %v", lk.PrintHeader, err)
-			}
-			fmt.Fprint(w, s)
-			fmt.Fprint(w, delmiter)
+			return err
 		}
 	}
 
 	if lk.SaveFile {
 		dir, err := os.MkdirTemp("", "")
 		if err != nil {
-			fatalf("while creating temporary directory: %v", err)
+			return fmt.Errorf("while creating temporary directory: %w", err)
 		}
 
 		for _, mp := range selectedParts {
@@ -280,7 +280,7 @@ func (lk *LetterKnife) Run() {
 				path := filepath.Join(dir, filename)
 				f, err = os.Create(path)
 				if err != nil {
-					fatalf("creating file: %v", err)
+					return fmt.Errorf("creating file: %w", err)
 				}
 			} else {
 				ext := extensionsByType(mp.mediaType)
@@ -290,13 +290,13 @@ func (lk *LetterKnife) Run() {
 
 				f, err = os.CreateTemp(dir, "*"+ext)
 				if err != nil {
-					fatalf("creating file: %v", err)
+					return fmt.Errorf("creating file: %w", err)
 				}
 			}
 
 			_, err = io.Copy(f, mp)
 			if err != nil {
-				fatalf("%v", err)
+				return err
 			}
 
 			f.Close()
@@ -304,6 +304,8 @@ func (lk *LetterKnife) Run() {
 			fmt.Fprint(w, delmiter)
 		}
 	}
+
+	return nil
 }
 
 type messagePart struct {
