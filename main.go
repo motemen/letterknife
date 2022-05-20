@@ -346,8 +346,11 @@ func (m *messagePart) Read(p []byte) (n int, err error) {
 	if m.r == nil {
 		var r io.Reader = m.body
 
-		if strings.EqualFold(m.header.Get("Content-Transfer-Encoding"), "base64") {
+		cte := m.header.Get("Content-Transfer-Encoding")
+		if strings.EqualFold(cte, "base64") {
 			r = base64.NewDecoder(base64.StdEncoding, r)
+		} else if strings.EqualFold(cte, "quoted-printable") {
+			r = quotedprintable.NewReader(r)
 		}
 
 		if charset := m.mediaTypeParams["charset"]; charset != "" {
@@ -424,10 +427,6 @@ func buildPartTree(header mail.Header, body io.Reader) (*messagePart, error) {
 	}
 
 	part.body = new(bytes.Buffer)
-	if strings.EqualFold(part.header.Get("Content-Transfer-Encoding"), "quoted-printable") {
-		body = quotedprintable.NewReader(body)
-	}
-
 	_, err = io.Copy(part.body, body)
 
 	return part, err

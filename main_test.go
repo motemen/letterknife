@@ -48,6 +48,15 @@ func TestRunMain_PrintContent(t *testing.T) {
 			out.String(),
 		))
 	})
+
+	t.Run("decodes base64 contents on singlepart content", func(t *testing.T) {
+		out, err := runLetterKnife(t, []string{"--plain"}, "plain.eml")
+		assert.NilError(t, err)
+		assert.Check(t, cmp.Equal(
+			`こんにちは世界🌏`+"\r\n\n",
+			out.String(),
+		))
+	})
 }
 
 func TestRunMain_SaveFile(t *testing.T) {
