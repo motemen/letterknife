@@ -26,15 +26,28 @@ func runLetterKnife(t *testing.T, args []string, filename string) (*bytes.Buffer
 }
 
 func TestRunMain_PrintContent(t *testing.T) {
-	out, err := runLetterKnife(t, []string{"--plain"}, "multipart.eml")
-	assert.NilError(t, err)
-	assert.Check(t, cmp.Contains(out.String(), "Hello! 😊"))
+	t.Run("selecting text/plain part from multipart content", func(t *testing.T) {
+		out, err := runLetterKnife(t, []string{"--plain"}, "multipart.eml")
+		assert.NilError(t, err)
+		assert.Check(t, cmp.Contains(out.String(), "Hello! 😊"))
+	})
 
-	out, err = runLetterKnife(t, []string{}, "plain.eml")
-	assert.NilError(t, err)
-	in, err := os.ReadFile("testdata/plain.eml")
-	assert.NilError(t, err)
-	assert.Check(t, cmp.Equal(string(in), out.String()))
+	t.Run("prints raw input if none is selected", func(t *testing.T) {
+		out, err := runLetterKnife(t, []string{}, "plain.eml")
+		assert.NilError(t, err)
+		in, err := os.ReadFile("testdata/plain.eml")
+		assert.NilError(t, err)
+		assert.Check(t, cmp.Equal(string(in), out.String()))
+	})
+
+	t.Run("decodes quoted-printable contents on singlepart content", func(t *testing.T) {
+		out, err := runLetterKnife(t, []string{"--html"}, "singlepart-quotedprintable.eml")
+		assert.NilError(t, err)
+		assert.Check(t, cmp.Equal(
+			`<div>Hello</div><div><a href="https://www.example.com/">Example Link</a></div>`+"\n\n",
+			out.String(),
+		))
+	})
 }
 
 func TestRunMain_SaveFile(t *testing.T) {

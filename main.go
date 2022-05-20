@@ -9,6 +9,7 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net/mail"
 	"os"
 	"path/filepath"
@@ -386,10 +387,14 @@ func newMessagePartFromHeader(header mail.Header) (*messagePart, error) {
 		return nil, fmt.Errorf("parsing content-type %q: %v", ct, err)
 	}
 
+	disposition, dispositionParams, _ := mime.ParseMediaType(header.Get("Content-Disposition"))
+
 	return &messagePart{
-		header:          header,
-		mediaType:       mt,
-		mediaTypeParams: params,
+		header:            header,
+		mediaType:         mt,
+		mediaTypeParams:   params,
+		disposition:       disposition,
+		dispositionParams: dispositionParams,
 	}, nil
 }
 
@@ -418,9 +423,13 @@ func buildPartTree(header mail.Header, body io.Reader) (*messagePart, error) {
 		return part, nil
 	}
 
-	part.disposition, part.dispositionParams, _ = mime.ParseMediaType(header.Get("Content-Disposition"))
 	part.body = new(bytes.Buffer)
+	if strings.EqualFold(part.header.Get("Content-Transfer-Encoding"), "quoted-printable") {
+		body = quotedprintable.NewReader(body)
+	}
+
 	_, err = io.Copy(part.body, body)
+
 	return part, err
 }
 
